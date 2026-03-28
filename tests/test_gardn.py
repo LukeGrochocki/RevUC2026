@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from garden_preview import _featherless_message_content, decode_base64_image
+import httpx
+
+from garden_preview import _featherless_message_content, decode_base64_image, featherless_chat
 from main import app, _cors_allow_origins
 
 # Minimal valid 1×1 PNG (transparent pixel)
@@ -52,6 +54,49 @@ def test_featherless_message_content_string():
 def test_featherless_message_content_missing_choices():
     with pytest.raises(RuntimeError, match="choices"):
         _featherless_message_content({})
+
+
+@patch("garden_preview.httpx.stream")
+def test_featherless_chat_retries_on_transport_error(mock_stream, monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "test-key")
+    monkeypatch.setenv("FEATHERLESS_RETRIES", "2")
+    bad = MagicMock()
+    bad.__enter__.return_value = bad
+    bad.__exit__.return_value = None
+    bad.is_success = True
+    bad.iter_lines.side_effect = httpx.RemoteProtocolError("connection dropped")
+
+    good = MagicMock()
+    good.__enter__.return_value = good
+    good.__exit__.return_value = None
+    good.is_success = True
+    sse = "data: " + json.dumps(
+        {"choices": [{"index": 0, "delta": {"content": "ok"}}]}
+    )
+    good.iter_lines.return_value = [sse, "data: [DONE]"]
+
+    mock_stream.side_effect = [bad, good]
+
+    out = featherless_chat(messages=[{"role": "user", "content": "hi"}])
+    assert out == "ok"
+    assert mock_stream.call_count == 2
+    assert mock_stream.call_args.kwargs["json"].get("stream") is True
+
+
+@patch("garden_preview.httpx.stream")
+@patch("garden_preview.httpx.post")
+def test_featherless_chat_non_streaming_when_disabled(mock_post, mock_stream, monkeypatch):
+    monkeypatch.setenv("FEATHERLESS_API_KEY", "test-key")
+    monkeypatch.setenv("FEATHERLESS_STREAM", "0")
+    ok = MagicMock()
+    ok.is_success = True
+    ok.json.return_value = {"choices": [{"message": {"content": "sync"}}]}
+    mock_post.return_value = ok
+
+    out = featherless_chat(messages=[{"role": "user", "content": "hi"}])
+    assert out == "sync"
+    mock_post.assert_called_once()
+    mock_stream.assert_not_called()
 
 
 def test_decode_base64_image_data_url():
@@ -250,3 +295,51 @@ def test_capture_screenshots_for_urls_success(mock_get, monkeypatch):
     params = call_kw[1]["params"]
     assert params["url"] == "https://example.com"
     assert params["access_key"] == "test-access-key"
+
+
+@patch("garden_preview.time.sleep")
+@patch("garden_preview.requests.get")
+def test_capture_screenshots_retries_on_500(mock_get, _mock_sleep, monkeypatch):
+    monkeypatch.setenv("SCREENSHOTONE_ACCESS_KEY", "test-access-key")
+    monkeypatch.setenv("SCREENSHOTONE_RETRIES", "3")
+    from garden_preview import capture_screenshots_for_urls
+
+    png_bytes = __import__("base64").b64decode(_TINY_PNG_B64)
+    bad = MagicMock()
+    bad.ok = False
+    bad.status_code = 500
+    bad.json.return_value = {
+        "error_message": "The API failed to serve your request.",
+        "is_successful": False,
+    }
+    bad.text = "{}"
+
+    good = MagicMock()
+    good.ok = True
+    good.headers = {"Content-Type": "image/png"}
+    good.content = png_bytes
+
+    mock_get.side_effect = [bad, good]
+
+    out = capture_screenshots_for_urls(["https://example.com"])
+    assert len(out) == 1
+    assert out[0] == _TINY_PNG_B64
+    assert mock_get.call_count == 2
+
+
+@patch("garden_preview.requests.get")
+def test_capture_screenshots_does_not_retry_on_400(mock_get, monkeypatch):
+    monkeypatch.setenv("SCREENSHOTONE_ACCESS_KEY", "test-access-key")
+    monkeypatch.setenv("SCREENSHOTONE_RETRIES", "5")
+    from garden_preview import capture_screenshots_for_urls
+
+    bad = MagicMock()
+    bad.ok = False
+    bad.status_code = 400
+    bad.json.return_value = {"error_message": "bad request"}
+    bad.text = "{}"
+    mock_get.return_value = bad
+
+    with pytest.raises(RuntimeError, match="HTTP 400"):
+        capture_screenshots_for_urls(["https://example.com"])
+    assert mock_get.call_count == 1

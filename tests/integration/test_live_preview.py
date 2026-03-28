@@ -56,9 +56,10 @@ def test_live_pipeline_example_sites_writes_artifacts(integration_gate):
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Two lightweight pages (Wikipedia often triggers ScreenshotOne 500s).
     urls = [
         "https://example.com",
-        "https://www.wikipedia.org/",
+        "https://example.org",
     ]
     user_notes = (
         "Focus on the main heading and primary navigation or links; "

@@ -1,4 +1,12 @@
 import os
+import warnings
+
+# Upstream google-genai uses typing aliases deprecated on Python 3.14+ (noise in logs).
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r"google\.genai\.types",
+)
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException

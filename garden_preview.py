@@ -5,11 +5,33 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 from typing import Any
 
+import httpx
 import requests
+from requests.exceptions import RequestException
 
 SCREENSHOTONE_TAKE_URL = "https://api.screenshotone.com/take"
+
+
+def _screenshotone_error_message(r: requests.Response) -> str:
+    try:
+        data = r.json()
+        if isinstance(data, dict):
+            em = data.get("error_message")
+            if em is not None:
+                return str(em)[:500]
+            err = data.get("error")
+            if isinstance(err, dict) and err.get("message") is not None:
+                return str(err["message"])[:500]
+    except Exception:
+        pass
+    return (r.text or "")[:500]
+
+
+def _screenshotone_status_retryable(status: int) -> bool:
+    return status == 429 or status >= 500
 
 
 def _strip_json_fence(text: str) -> str:
@@ -59,6 +81,7 @@ def capture_screenshots_for_urls(urls: list[str]) -> list[str]:
     timeout = int(os.getenv("SCREENSHOTONE_TIMEOUT", "90"))
     viewport_w = int(os.getenv("SCREENSHOTONE_VIEWPORT_WIDTH", "1280"))
     viewport_h = int(os.getenv("SCREENSHOTONE_VIEWPORT_HEIGHT", "720"))
+    max_attempts = max(1, int(os.getenv("SCREENSHOTONE_RETRIES", "4")))
     out: list[str] = []
 
     for url in urls:
@@ -72,25 +95,37 @@ def capture_screenshots_for_urls(urls: list[str]) -> list[str]:
         if os.getenv("SCREENSHOTONE_FULL_PAGE", "").lower() in ("1", "true", "yes"):
             params["full_page"] = "true"
 
-        r = requests.get(SCREENSHOTONE_TAKE_URL, params=params, timeout=timeout)
-        if not r.ok:
+        for attempt in range(max_attempts):
             try:
-                err = r.json().get("error") or {}
-                msg = err.get("message", r.text[:300])
-            except Exception:
-                msg = r.text[:300]
+                r = requests.get(
+                    SCREENSHOTONE_TAKE_URL, params=params, timeout=timeout
+                )
+            except RequestException as e:
+                if attempt + 1 >= max_attempts:
+                    raise RuntimeError(
+                        f"ScreenshotOne request failed for {url!r} after "
+                        f"{max_attempts} attempt(s): {e!s}"
+                    ) from e
+                time.sleep(min(2.0**attempt, 12.0))
+                continue
+
+            if r.ok:
+                ct = (r.headers.get("Content-Type") or "").lower()
+                if "image" not in ct and "octet-stream" not in ct:
+                    raise RuntimeError(
+                        f"ScreenshotOne returned non-image for {url!r} "
+                        f"(Content-Type={ct!r}): {r.text[:400]}"
+                    )
+                out.append(base64.b64encode(r.content).decode("ascii"))
+                break
+
+            msg = _screenshotone_error_message(r)
+            if _screenshotone_status_retryable(r.status_code) and attempt + 1 < max_attempts:
+                time.sleep(min(2.0**attempt, 12.0))
+                continue
             raise RuntimeError(
                 f"ScreenshotOne failed for {url!r}: HTTP {r.status_code} {msg}"
             )
-
-        ct = (r.headers.get("Content-Type") or "").lower()
-        if "image" not in ct and "octet-stream" not in ct:
-            raise RuntimeError(
-                f"ScreenshotOne returned non-image for {url!r} (Content-Type={ct!r}): "
-                f"{r.text[:400]}"
-            )
-
-        out.append(base64.b64encode(r.content).decode("ascii"))
 
     return out
 
@@ -127,9 +162,11 @@ def gemini_analyze_screenshots(
 
     from google import genai
     from google.genai import types
+    from google.genai.errors import ClientError as GenaiClientError
 
     client = genai.Client(api_key=api_key)
-    model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    # gemini-2.0-flash is not available to new API keys; default to a current model.
+    model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     parts: list[Any] = []
     intro = f"""You are helping users remix pieces of websites into a "garden" collage.
@@ -163,10 +200,18 @@ For EACH screenshot in order, respond with ONLY valid JSON (no markdown, no code
             types.Part.from_bytes(data=raw, mime_type="image/png"),
         )
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=parts,
-    )
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=parts,
+        )
+    except GenaiClientError as e:
+        raise RuntimeError(
+            f"Gemini API error: {e}. "
+            "Set GEMINI_MODEL in .env to a model your key supports "
+            "(e.g. gemini-2.5-flash or gemini-2.5-pro)."
+        ) from e
+
     if not getattr(response, "candidates", None):
         raise RuntimeError("Gemini returned no candidates (blocked or empty).")
     text = _gemini_response_text(response)
@@ -194,35 +239,131 @@ def _gemini_response_text(response: Any) -> str:
     return "".join(chunks)
 
 
+def _featherless_collect_sse_assistant_text(response: httpx.Response) -> str:
+    """Accumulate assistant text from an OpenAI-style chat completions SSE stream."""
+    parts: list[str] = []
+    for line in response.iter_lines():
+        if not line:
+            continue
+        line = line.strip()
+        if not line or line.startswith(":"):
+            continue
+        if line.startswith("data:"):
+            raw = line[5:].strip()
+        else:
+            continue
+        if raw == "[DONE]":
+            break
+        try:
+            chunk: Any = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            c = delta.get("content")
+            if isinstance(c, str) and c:
+                parts.append(c)
+            elif isinstance(c, list):
+                for block in c:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = block.get("text")
+                        if isinstance(t, str):
+                            parts.append(t)
+    out = "".join(parts)
+    if not out.strip():
+        raise RuntimeError(
+            "Featherless streaming returned no assistant text (empty SSE or parse miss)."
+        )
+    return out
+
+
 def featherless_chat(
     *,
     messages: list[dict[str, str]],
     model: str | None = None,
-    timeout: int = 180,
+    timeout: int | None = None,
 ) -> str:
     key = os.getenv("FEATHERLESS_API_KEY")
     if not key:
         raise RuntimeError("FEATHERLESS_API_KEY is not set.")
 
     model = model or os.getenv(
-        "FEATHERLESS_MODEL", "Qwen/Qwen2.5-Coder-32B-Instruct"
+        "FEATHERLESS_MODEL", "moonshotai/Kimi-K2.5"
     )
-    r = requests.post(
-        "https://api.featherless.ai/v1/chat/completions",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-        },
-        json={"model": model, "messages": messages},
-        timeout=timeout,
+    # Long generations + chunked responses can drop mid-stream; retry transient errors.
+    req_timeout = timeout if timeout is not None else int(
+        os.getenv("FEATHERLESS_TIMEOUT", "300")
     )
-    if not r.ok:
-        raise RuntimeError(f"Featherless HTTP {r.status_code}: {r.text}")
-    try:
-        data = r.json()
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Featherless returned non-JSON body: {r.text[:500]}") from e
-    return _featherless_message_content(data)
+    max_attempts = max(1, int(os.getenv("FEATHERLESS_RETRIES", "5")))
+    url = "https://api.featherless.ai/v1/chat/completions"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+        # Avoid pooled keep-alive connections that some proxies truncate on long bodies.
+        "Connection": "close",
+    }
+    # Cap completion size — very long JSON+HTML bodies often hit incomplete chunked reads upstream.
+    max_tokens = int(os.getenv("FEATHERLESS_MAX_TOKENS", "4096"))
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    # SSE streaming uses small incremental chunks; avoids one huge non-streaming chunked body.
+    use_stream = os.getenv("FEATHERLESS_STREAM", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    timeout = httpx.Timeout(req_timeout)
+
+    for attempt in range(max_attempts):
+        try:
+            if use_stream:
+                stream_payload = {**payload, "stream": True}
+                with httpx.stream(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json=stream_payload,
+                    timeout=timeout,
+                ) as r:
+                    if not r.is_success:
+                        err_body = r.read().decode("utf-8", errors="replace")[:800]
+                        raise RuntimeError(
+                            f"Featherless HTTP {r.status_code}: {err_body}"
+                        )
+                    return _featherless_collect_sse_assistant_text(r)
+            r = httpx.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+            if not r.is_success:
+                raise RuntimeError(f"Featherless HTTP {r.status_code}: {r.text}")
+            try:
+                data = r.json()
+            except json.JSONDecodeError as e:
+                body_preview = (r.text or "")[:500]
+                raise RuntimeError(
+                    f"Featherless returned non-JSON body: {body_preview}"
+                ) from e
+            return _featherless_message_content(data)
+        except httpx.TransportError as e:
+            if attempt + 1 >= max_attempts:
+                raise RuntimeError(
+                    f"Featherless connection failed after {max_attempts} attempt(s): {e!s}. "
+                    "This is often a dropped chunked response; try again or increase "
+                    "FEATHERLESS_TIMEOUT / FEATHERLESS_RETRIES."
+                ) from e
+            time.sleep(min(2.0**attempt, 15.0))
 
 
 def _featherless_message_content(data: Any) -> str:
@@ -273,11 +414,13 @@ def featherless_build_previews(
     gemini_context: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Generate self-contained HTML preview snippets per requested part."""
-    gemini_blob = (
-        json.dumps(gemini_context, indent=2)
-        if gemini_context
-        else "(no screenshot analysis — rely on URLs and user notes only)"
-    )
+    if gemini_context:
+        gemini_blob = json.dumps(gemini_context, separators=(",", ":"))
+        _max = int(os.getenv("FEATHERLESS_GEMINI_CONTEXT_CHARS", "20000"))
+        if len(gemini_blob) > _max:
+            gemini_blob = gemini_blob[:_max] + "\n…(truncated for prompt size)"
+    else:
+        gemini_blob = "(no screenshot analysis — rely on URLs and user notes only)"
     system = """You are a front-end expert building small preview snippets for a product called Gardn.
 Each preview is one self-contained HTML fragment: a single outer element using inline CSS only (no external assets unless HTTPS URLs from the user's context).
 Output ONLY valid JSON, no markdown fences, no commentary outside JSON."""
@@ -303,7 +446,8 @@ Return JSON with this exact shape:
   ]
 }}
 
-Create one entry per distinct part the user asked for; if vague, pick up to {min(5, max(1, len(urls)))} clear UI regions."""
+Create one entry per distinct part the user asked for; if vague, pick up to {min(5, max(1, len(urls)))} clear UI regions.
+Keep each preview_html compact (minimal inline CSS, no long copy)."""
 
     raw = featherless_chat(
         messages=[

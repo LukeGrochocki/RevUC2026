@@ -13,7 +13,14 @@ from __future__ import annotations
 
 import json
 import sys
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r"google\.genai\.types",
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -32,7 +39,7 @@ def main() -> None:
 
     urls = [
         "https://example.com",
-        "https://www.wikipedia.org/",
+        "https://example.org",
     ]
     user_notes = (
         "Call out the main heading and any obvious nav or links; "

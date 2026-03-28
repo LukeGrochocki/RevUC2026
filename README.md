@@ -23,7 +23,7 @@ Copy `.env.example` to `.env` and fill in secrets. Never commit `.env`. If keys 
 - `FEATHERLESS_API_KEY` — required for HTML previews.
 - `GOOGLE_API_KEY` or `GEMINI_API_KEY` — required for Gemini (vision of captured screenshots). The app uses the **`google-genai`** Python SDK (not the deprecated `google-generativeai` package).
 - `SCREENSHOTONE_ACCESS_KEY` — required unless the client sends `screenshots` with the same length as `urls` (override).
-- Optional: `GEMINI_MODEL` (default `gemini-2.0-flash`), `FEATHERLESS_MODEL`, `CORS_ORIGINS` (comma-separated; default `*`), `SCREENSHOTONE_VIEWPORT_WIDTH` / `HEIGHT`, `SCREENSHOTONE_TIMEOUT`, `SCREENSHOTONE_FULL_PAGE`.
+- Optional: `GEMINI_MODEL` (default `gemini-2.5-flash`), `FEATHERLESS_MODEL`, `FEATHERLESS_TIMEOUT` (default `300` seconds), `FEATHERLESS_RETRIES` (default `3`, for transient chunked-stream drops), `CORS_ORIGINS` (comma-separated; default `*`), `SCREENSHOTONE_VIEWPORT_WIDTH` / `HEIGHT`, `SCREENSHOTONE_TIMEOUT`, `SCREENSHOTONE_FULL_PAGE`.
 
 ## Frontend ↔ backend
 
