@@ -104,19 +104,28 @@ For EACH screenshot in order, respond with ONLY valid JSON (no markdown, no code
 """
     parts.append(intro)
 
-    for i, b64 in enumerate(screenshots_b64):
-        raw = decode_base64_image(b64)
-        img = Image.open(io.BytesIO(raw))
-        parts.append(f"[Screenshot index {i}]")
-        parts.append(img)
+    pil_images: list[Any] = []
+    try:
+        for i, b64 in enumerate(screenshots_b64):
+            raw = decode_base64_image(b64)
+            img = Image.open(io.BytesIO(raw))
+            pil_images.append(img)
+            parts.append(f"[Screenshot index {i}]")
+            parts.append(img)
 
-    response = model.generate_content(parts)
-    if not response.candidates:
-        raise RuntimeError("Gemini returned no candidates (blocked or empty).")
-    text = _gemini_response_text(response)
-    if not text.strip():
-        raise RuntimeError("Gemini returned empty text.")
-    return parse_model_json(text)
+        response = model.generate_content(parts)
+        if not response.candidates:
+            raise RuntimeError("Gemini returned no candidates (blocked or empty).")
+        text = _gemini_response_text(response)
+        if not text.strip():
+            raise RuntimeError("Gemini returned empty text.")
+        return parse_model_json(text)
+    finally:
+        for im in pil_images:
+            try:
+                im.close()
+            except Exception:
+                pass
 
 
 def _gemini_response_text(response: Any) -> str:
@@ -162,8 +171,52 @@ def featherless_chat(
     )
     if not r.ok:
         raise RuntimeError(f"Featherless HTTP {r.status_code}: {r.text}")
-    data = r.json()
-    return data["choices"][0]["message"]["content"]
+    try:
+        data = r.json()
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Featherless returned non-JSON body: {r.text[:500]}") from e
+    return _featherless_message_content(data)
+
+
+def _featherless_message_content(data: Any) -> str:
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Featherless response JSON was not an object (got {type(data).__name__})."
+        )
+    choices = data.get("choices")
+    if not isinstance(choices, list) or len(choices) == 0:
+        raise RuntimeError(
+            "Featherless response missing or empty 'choices'; "
+            f"keys present: {list(data.keys())!r}."
+        )
+    first = choices[0]
+    if not isinstance(first, dict):
+        raise RuntimeError("Featherless response choices[0] is not an object.")
+    msg = first.get("message")
+    if not isinstance(msg, dict):
+        raise RuntimeError(
+            "Featherless response missing a 'message' object on the first choice."
+        )
+    content = msg.get("content")
+    if content is None:
+        raise RuntimeError(
+            "Featherless response missing 'content' on the assistant message."
+        )
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # Some APIs return structured content parts
+        parts_out: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text")
+                if isinstance(t, str):
+                    parts_out.append(t)
+            elif isinstance(block, str):
+                parts_out.append(block)
+        if parts_out:
+            return "".join(parts_out)
+    return str(content)
 
 
 def featherless_build_previews(

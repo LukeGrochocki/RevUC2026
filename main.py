@@ -9,11 +9,19 @@ from garden_preview import run_garden_preview_pipeline
 
 load_dotenv()
 
+
+def _cors_allow_origins() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", "*")
+    if raw.strip() == "" or raw.strip() == "*":
+        return ["*"]
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
 app = FastAPI(title="Gardn API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

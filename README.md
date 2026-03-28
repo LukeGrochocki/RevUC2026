@@ -11,6 +11,8 @@ Server: `http://localhost:8000` — OpenAPI docs at `http://localhost:8000/docs`
 
 **Environment (`.env`):**
 
+Copy `.env.example` to `.env` and fill in secrets. Never commit `.env`. If keys were ever exposed (e.g. in chat or a public repo), rotate them in the Featherless and Google AI dashboards.
+
 - `FEATHERLESS_API_KEY` — required for HTML previews.
 - `GOOGLE_API_KEY` or `GEMINI_API_KEY` — required if you send `screenshots` (Gemini vision pass).
 - Optional: `GEMINI_MODEL` (default `gemini-2.0-flash`), `FEATHERLESS_MODEL`, `CORS_ORIGINS` (comma-separated; default `*`).
