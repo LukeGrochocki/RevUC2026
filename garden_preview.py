@@ -9,8 +9,7 @@ from typing import Any
 
 import requests
 
-# Optional: only imported when Gemini runs
-_genai = None
+SCREENSHOTONE_TAKE_URL = "https://api.screenshotone.com/take"
 
 
 def _strip_json_fence(text: str) -> str:
@@ -45,13 +44,68 @@ def decode_base64_image(data: str) -> bytes:
     return base64.b64decode(s, validate=True)
 
 
-def _get_genai():
-    global _genai
-    if _genai is None:
-        import google.generativeai as genai
+def capture_screenshots_for_urls(urls: list[str]) -> list[str]:
+    """
+    Fetch a PNG screenshot per URL via ScreenshotOne.
+    Returns raw base64-encoded image strings (no data: prefix), same order as urls.
+    """
+    access = os.getenv("SCREENSHOTONE_ACCESS_KEY")
+    if not access:
+        raise RuntimeError(
+            "Set SCREENSHOTONE_ACCESS_KEY to capture screenshots of URLs "
+            "(or pass client screenshots with the same length as urls)."
+        )
 
-        _genai = genai
-    return _genai
+    timeout = int(os.getenv("SCREENSHOTONE_TIMEOUT", "90"))
+    viewport_w = int(os.getenv("SCREENSHOTONE_VIEWPORT_WIDTH", "1280"))
+    viewport_h = int(os.getenv("SCREENSHOTONE_VIEWPORT_HEIGHT", "720"))
+    out: list[str] = []
+
+    for url in urls:
+        params: dict[str, Any] = {
+            "access_key": access,
+            "url": url,
+            "format": "png",
+            "viewport_width": viewport_w,
+            "viewport_height": viewport_h,
+        }
+        if os.getenv("SCREENSHOTONE_FULL_PAGE", "").lower() in ("1", "true", "yes"):
+            params["full_page"] = "true"
+
+        r = requests.get(SCREENSHOTONE_TAKE_URL, params=params, timeout=timeout)
+        if not r.ok:
+            try:
+                err = r.json().get("error") or {}
+                msg = err.get("message", r.text[:300])
+            except Exception:
+                msg = r.text[:300]
+            raise RuntimeError(
+                f"ScreenshotOne failed for {url!r}: HTTP {r.status_code} {msg}"
+            )
+
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "image" not in ct and "octet-stream" not in ct:
+            raise RuntimeError(
+                f"ScreenshotOne returned non-image for {url!r} (Content-Type={ct!r}): "
+                f"{r.text[:400]}"
+            )
+
+        out.append(base64.b64encode(r.content).decode("ascii"))
+
+    return out
+
+
+def resolve_screenshot_b64_list(
+    urls: list[str],
+    client_screenshots_b64: list[str],
+) -> tuple[list[str], str]:
+    """
+    Prefer client-provided images when count matches urls; otherwise ScreenshotOne.
+    Returns (base64_strings, source) where source is 'client' or 'screenshotone'.
+    """
+    if client_screenshots_b64 and len(client_screenshots_b64) == len(urls):
+        return client_screenshots_b64, "client"
+    return capture_screenshots_for_urls(urls), "screenshotone"
 
 
 def gemini_analyze_screenshots(
@@ -71,13 +125,11 @@ def gemini_analyze_screenshots(
             "Set GOOGLE_API_KEY or GEMINI_API_KEY for screenshot analysis."
         )
 
-    genai = _get_genai()
-    genai.configure(api_key=api_key)
-    model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-    model = genai.GenerativeModel(model_name)
+    from google import genai
+    from google.genai import types
 
-    from PIL import Image
-    import io
+    client = genai.Client(api_key=api_key)
+    model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     parts: list[Any] = []
     intro = f"""You are helping users remix pieces of websites into a "garden" collage.
@@ -104,28 +156,23 @@ For EACH screenshot in order, respond with ONLY valid JSON (no markdown, no code
 """
     parts.append(intro)
 
-    pil_images: list[Any] = []
-    try:
-        for i, b64 in enumerate(screenshots_b64):
-            raw = decode_base64_image(b64)
-            img = Image.open(io.BytesIO(raw))
-            pil_images.append(img)
-            parts.append(f"[Screenshot index {i}]")
-            parts.append(img)
+    for i, b64 in enumerate(screenshots_b64):
+        raw = decode_base64_image(b64)
+        parts.append(f"[Screenshot index {i}]")
+        parts.append(
+            types.Part.from_bytes(data=raw, mime_type="image/png"),
+        )
 
-        response = model.generate_content(parts)
-        if not response.candidates:
-            raise RuntimeError("Gemini returned no candidates (blocked or empty).")
-        text = _gemini_response_text(response)
-        if not text.strip():
-            raise RuntimeError("Gemini returned empty text.")
-        return parse_model_json(text)
-    finally:
-        for im in pil_images:
-            try:
-                im.close()
-            except Exception:
-                pass
+    response = client.models.generate_content(
+        model=model_name,
+        contents=parts,
+    )
+    if not getattr(response, "candidates", None):
+        raise RuntimeError("Gemini returned no candidates (blocked or empty).")
+    text = _gemini_response_text(response)
+    if not text.strip():
+        raise RuntimeError("Gemini returned empty text.")
+    return parse_model_json(text)
 
 
 def _gemini_response_text(response: Any) -> str:
@@ -314,18 +361,16 @@ def run_garden_preview_pipeline(
     screenshots_b64: list[str],
 ) -> dict[str, Any]:
     """
-    Full pipeline. Screenshots optional; if provided, Gemini runs and informs Featherless.
+    Full pipeline: resolve screenshots (ScreenshotOne per URL, or client images if
+    lengths match), Gemini vision pass, then Featherless HTML previews.
     """
-    gemini_context: dict[str, Any] | None = None
-    if screenshots_b64:
-        if len(screenshots_b64) != len(urls):
-            # Still run: Gemini prompt explains mismatch
-            pass
-        gemini_context = gemini_analyze_screenshots(
-            urls=urls,
-            user_notes=user_notes,
-            screenshots_b64=screenshots_b64,
-        )
+    images_b64, screenshot_source = resolve_screenshot_b64_list(urls, screenshots_b64)
+
+    gemini_context = gemini_analyze_screenshots(
+        urls=urls,
+        user_notes=user_notes,
+        screenshots_b64=images_b64,
+    )
 
     featherless_json = featherless_build_previews(
         urls=urls,
@@ -337,6 +382,7 @@ def run_garden_preview_pipeline(
 
     return {
         "previews": merged,
+        "screenshot_source": screenshot_source,
         "gemini_raw": gemini_context,
         "featherless_raw": featherless_json,
     }

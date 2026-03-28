@@ -29,12 +29,12 @@ app.add_middleware(
 
 
 class GardenPreviewRequest(BaseModel):
-    """Payload from the frontend: URLs, what to emphasize, optional screenshot(s) per URL."""
+    """URLs + notes; screenshots are captured via ScreenshotOne unless you override."""
 
     urls: list[str] = Field(
         ...,
         min_length=1,
-        description="Page URLs the user is pulling from (order matches screenshots).",
+        description="Page URLs to capture (one ScreenshotOne shot per URL, in order).",
     )
     user_notes: str = Field(
         default="",
@@ -42,7 +42,11 @@ class GardenPreviewRequest(BaseModel):
     )
     screenshots: list[str] = Field(
         default_factory=list,
-        description="Base64 or data-URL images; index i pairs with urls[i] when lengths match.",
+        description=(
+            "Optional. If len(screenshots) == len(urls), these base64/data-URL images "
+            "are used instead of ScreenshotOne (testing/overrides). Otherwise leave empty "
+            "to capture each URL server-side."
+        ),
     )
     include_model_debug: bool = Field(
         default=False,
@@ -58,8 +62,8 @@ def health():
 @app.post("/api/garden-preview")
 def garden_preview(body: GardenPreviewRequest):
     """
-    Runs Gemini on screenshots (if any), then Featherless to produce HTML preview fragments.
-    Returns rows the UI can render in iframe / shadow DOM containers.
+    Captures each URL with ScreenshotOne (unless client sends matching-length screenshots),
+    runs Gemini on those images, then Featherless for HTML preview fragments.
     """
     try:
         out = run_garden_preview_pipeline(
