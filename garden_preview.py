@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -64,6 +66,83 @@ def decode_base64_image(data: str) -> bytes:
             raise ValueError("Invalid data URL: missing comma")
         s = s.split(",", 1)[1]
     return base64.b64decode(s, validate=True)
+
+
+# When criteria for a URL is empty, Gemini/Featherless use this analysis target.
+DEFAULT_SITE_CRITERIA = (
+    "Analyze the overall visual style of the entire page: typography, color palette, "
+    "spacing, and layout of major regions (header, content, footer as visible)."
+)
+
+
+def effective_criteria(raw: str) -> str:
+    """Return criteria to send to models; empty/whitespace → whole-site default."""
+    t = (raw or "").strip()
+    return t if t else DEFAULT_SITE_CRITERIA
+
+
+def normalize_sites(
+    sites: list[dict[str, str]] | None,
+    *,
+    urls: list[str] | None = None,
+    user_notes: str = "",
+) -> list[dict[str, str]]:
+    """
+    Build a list of {url, criteria} dicts. Prefer ``sites``; otherwise legacy ``urls``
+    with the same ``user_notes`` applied to each URL.
+    """
+    if sites is not None and len(sites) > 0:
+        return [{"url": s["url"], "criteria": s.get("criteria", "")} for s in sites]
+    if urls:
+        return [{"url": u, "criteria": user_notes} for u in urls]
+    raise ValueError("Provide non-empty `sites` or `urls`.")
+
+
+def render_html_fragment_to_png_base64(html_fragment: str) -> str | None:
+    """
+    Rasterize a small HTML fragment to PNG (base64, no data-URL prefix).
+    Uses headless Chrome via html2image when available; returns None if disabled
+    or rendering fails (no Chromium, etc.).
+    """
+    if os.getenv("GARDN_DISABLE_HTML_PREVIEW", "").lower() in ("1", "true", "yes"):
+        return None
+    frag = (html_fragment or "").strip()
+    if not frag:
+        return None
+    try:
+        from html2image import Html2Image
+    except ImportError:
+        return None
+    full = (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"/>"
+        "<style>html,body{margin:0;padding:12px;box-sizing:border-box;"
+        "font-family:system-ui,sans-serif;background:#fff;}</style></head><body>"
+        f"{frag}</body></html>"
+    )
+    w = int(os.getenv("GARDN_PREVIEW_WIDTH", "800"))
+    h = int(os.getenv("GARDN_PREVIEW_HEIGHT", "600"))
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            hti = Html2Image(output_path=td, size=(w, h))
+            hti.screenshot(html_str=full, save_as="garden_preview.png")
+            data = (Path(td) / "garden_preview.png").read_bytes()
+            return base64.b64encode(data).decode("ascii")
+    except Exception:
+        return None
+
+
+def _coerce_preview_image_b64(
+    html: str, explicit: str | None
+) -> str | None:
+    if explicit and str(explicit).strip():
+        s = str(explicit).strip()
+        try:
+            decode_base64_image(s)
+        except Exception:
+            pass
+        else:
+            return s
+    return render_html_fragment_to_png_base64(html)
 
 
 def capture_screenshots_for_urls(urls: list[str]) -> list[str]:
@@ -145,14 +224,14 @@ def resolve_screenshot_b64_list(
 
 def gemini_analyze_screenshots(
     *,
-    urls: list[str],
-    user_notes: str,
+    sites: list[dict[str, str]],
     screenshots_b64: list[str],
     model_name: str | None = None,
 ) -> dict[str, Any]:
     """
-    Vision pass: describe each screenshot in context of URLs and user intent.
-    Expects screenshots_b64 aligned by index with urls (same length ideal).
+    Vision pass: for each screenshot, apply that URL's criteria and return HTML plus
+    optional preview image (filled server-side if omitted).
+    Expects ``screenshots_b64`` aligned by index with ``sites``.
     """
     api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -169,28 +248,10 @@ def gemini_analyze_screenshots(
     model_name = model_name or os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
     parts: list[Any] = []
-    intro = f"""You are helping users remix pieces of websites into a "garden" collage.
-
-URLs provided (in order, index starting at 0):
-{json.dumps(urls, indent=2)}
-
-What the user wants to capture or emphasize (specific tags, components, or vibes):
-{user_notes or "(none)"}
-
-There are {len(screenshots_b64)} screenshot(s) in order. Each image corresponds to the URL at the same index when counts match; otherwise describe each image and relate it to the closest URL by context.
-
-For EACH screenshot in order, respond with ONLY valid JSON (no markdown, no code fences) in this exact shape:
-{{
-  "screenshots": [
-    {{
-      "url_index": <int, 0-based index of the URL this shot best matches>,
-      "url": "<string, copy from list or best guess>",
-      "visual_description": "<colors, typography, spacing, notable UI regions>",
-      "requested_elements_focus": "<how the user's requested parts appear in this shot>"
-    }}
-  ]
-}}
-"""
+    intro = gemini_vision_instruction_text(
+        sites=sites,
+        screenshot_count=len(screenshots_b64),
+    )
     parts.append(intro)
 
     for i, b64 in enumerate(screenshots_b64):
@@ -217,7 +278,67 @@ For EACH screenshot in order, respond with ONLY valid JSON (no markdown, no code
     text = _gemini_response_text(response)
     if not text.strip():
         raise RuntimeError("Gemini returned empty text.")
-    return parse_model_json(text)
+    parsed = parse_model_json(text)
+    _attach_gemini_preview_images(parsed)
+    return parsed
+
+
+def _attach_gemini_preview_images(gemini_context: dict[str, Any]) -> None:
+    for s in gemini_context.get("screenshots") or []:
+        if not isinstance(s, dict):
+            continue
+        html = s.get("preview_html") or ""
+        img = s.get("preview_image_png_base64")
+        b64 = _coerce_preview_image_b64(html, img if isinstance(img, str) else None)
+        if b64:
+            s["preview_image_png_base64"] = b64
+
+
+def gemini_vision_instruction_text(
+    *,
+    sites: list[dict[str, str]],
+    screenshot_count: int,
+) -> str:
+    """Text instruction Gemini receives before the screenshot image parts (for tracing/debug)."""
+    site_rows: list[dict[str, Any]] = []
+    for i, site in enumerate(sites):
+        u = site.get("url", "")
+        c_raw = site.get("criteria", "")
+        site_rows.append(
+            {
+                "index": i,
+                "url": u,
+                "criteria": c_raw,
+                "effective_analysis_target": effective_criteria(c_raw),
+            }
+        )
+    sites_block = json.dumps(site_rows, indent=2)
+
+    return f"""You are helping users remix pieces of websites into a "garden" collage.
+
+Sites (one screenshot per site, same order — index i matches screenshot i). If criteria is empty for a URL, analyze the overall visual style of the whole page (see effective_analysis_target in the JSON above).
+{sites_block}
+
+There are {screenshot_count} screenshot(s) in order. Each image is the page for the URL at the same index.
+
+For EACH screenshot in order, produce a small self-contained HTML fragment (inline CSS only, no external assets) that reflects what was asked: either the user's criteria for that URL, or the overall visual style of the whole page if criteria was left empty. Also include a short summary sentence.
+
+Respond with ONLY valid JSON (no markdown, no code fences) in this exact shape:
+{{
+  "screenshots": [
+    {{
+      "url_index": <int, 0-based index, should match screenshot order>,
+      "url": "<string from the list>",
+      "criteria": "<user's criteria string for this URL, or empty string>",
+      "effective_analysis_target": "<the analysis target you used (verbatim from effective_analysis_target in the list or the default whole-page style)>",
+      "summary": "<one sentence>",
+      "preview_html": "<div style=\\"...\\">...</div>",
+      "preview_image_png_base64": null
+    }}
+  ]
+}}
+
+Set preview_image_png_base64 to JSON null; the server may fill a raster preview. Focus on accurate, compact preview_html."""
 
 
 def _gemini_response_text(response: Any) -> str:
@@ -407,92 +528,138 @@ def _featherless_message_content(data: Any) -> str:
     return str(content)
 
 
-def featherless_build_previews(
+def featherless_preview_messages(
     *,
-    urls: list[str],
-    user_notes: str,
+    sites: list[dict[str, str]],
     gemini_context: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Generate self-contained HTML preview snippets per requested part."""
+) -> list[dict[str, str]]:
+    """Chat messages sent to Featherless (same as `featherless_build_previews` uses)."""
     if gemini_context:
         gemini_blob = json.dumps(gemini_context, separators=(",", ":"))
         _max = int(os.getenv("FEATHERLESS_GEMINI_CONTEXT_CHARS", "20000"))
         if len(gemini_blob) > _max:
             gemini_blob = gemini_blob[:_max] + "\n…(truncated for prompt size)"
     else:
-        gemini_blob = "(no screenshot analysis — rely on URLs and user notes only)"
+        gemini_blob = "(no screenshot analysis — rely on sites only)"
     system = """You are a front-end expert building small preview snippets for a product called Gardn.
 Each preview is one self-contained HTML fragment: a single outer element using inline CSS only (no external assets unless HTTPS URLs from the user's context).
 Output ONLY valid JSON, no markdown fences, no commentary outside JSON."""
 
-    user = f"""URLs:
-{json.dumps(urls, indent=2)}
+    site_rows = []
+    for i, site in enumerate(sites):
+        c_raw = site.get("criteria", "")
+        site_rows.append(
+            {
+                "index": i,
+                "url": site.get("url", ""),
+                "criteria": c_raw,
+                "effective_analysis_target": effective_criteria(c_raw),
+            }
+        )
 
-User notes (what to extract or prioritize, e.g. <nav>, a specific button, hero):
-{user_notes or "(none)"}
+    user = f"""Sites (one preview per site, same order). If criteria is empty, model the overall visual style of the whole page (see effective_analysis_target).
+{json.dumps(site_rows, indent=2)}
 
-Screenshot / vision analysis (from Gemini):
+Screenshot / vision analysis from Gemini (HTML fragments + metadata per URL):
 {gemini_blob}
 
 Return JSON with this exact shape:
 {{
   "previews": [
     {{
-      "title": "short label e.g. Navigation",
-      "source_url": "must be one of the URLs above or the closest match",
+      "title": "short label for this URL's preview",
+      "source_url": "must match the site URL at the same index",
+      "criteria": "<same criteria string as input for that site, or empty>",
       "preview_html": "<div style=\\"...\\">...</div>",
+      "preview_image_png_base64": null,
       "notes": "one sentence on what this preview shows"
     }}
   ]
 }}
 
-Create one entry per distinct part the user asked for; if vague, pick up to {min(5, max(1, len(urls)))} clear UI regions.
+There must be exactly {len(sites)} preview object(s), in the same order as the sites list.
+Set preview_image_png_base64 to JSON null; the server may fill a raster preview.
 Keep each preview_html compact (minimal inline CSS, no long copy)."""
 
-    raw = featherless_chat(
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def featherless_build_previews(
+    *,
+    sites: list[dict[str, str]],
+    gemini_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Generate self-contained HTML preview snippets per site."""
+    messages = featherless_preview_messages(
+        sites=sites,
+        gemini_context=gemini_context,
     )
-    return parse_model_json(raw)
+    raw = featherless_chat(messages=messages)
+    parsed = parse_model_json(raw)
+    _attach_featherless_preview_images(parsed)
+    return parsed
+
+
+def _attach_featherless_preview_images(featherless_json: dict[str, Any]) -> None:
+    for p in featherless_json.get("previews") or []:
+        if not isinstance(p, dict):
+            continue
+        html = p.get("preview_html") or ""
+        img = p.get("preview_image_png_base64")
+        b64 = _coerce_preview_image_b64(html, img if isinstance(img, str) else None)
+        if b64:
+            p["preview_image_png_base64"] = b64
 
 
 def merge_preview_response(
     gemini: dict[str, Any] | None,
     featherless: dict[str, Any],
+    sites: list[dict[str, str]],
 ) -> list[dict[str, Any]]:
     """
-    Build frontend-friendly rows: each row pairs Featherless HTML with Gemini visual text when possible.
+    One row per site: criteria, Gemini HTML+image, Featherless HTML+image, plus notes.
     """
     shots = (gemini or {}).get("screenshots") or []
     previews = featherless.get("previews") or []
     out: list[dict[str, Any]] = []
 
-    for i, p in enumerate(previews):
-        row = {
-            "title": p.get("title", f"Part {i + 1}"),
-            "source_url": p.get("source_url"),
-            "preview_html": p.get("preview_html", ""),
-            "featherless_notes": p.get("notes", ""),
-            "visual_summary": None,
-            "screenshot_analysis": None,
-        }
-        url = p.get("source_url") or ""
-        # Match Gemini entry by url or by index
+    for i, site in enumerate(sites):
+        url = site.get("url", "")
+        crit = site.get("criteria", "")
+        p = previews[i] if i < len(previews) else {}
         g = None
         for s in shots:
-            if s.get("url") == url:
+            if isinstance(s, dict) and s.get("url") == url:
                 g = s
                 break
         if g is None and i < len(shots):
             g = shots[i]
-        if isinstance(g, dict):
-            row["visual_summary"] = g.get("visual_description")
-            row["screenshot_analysis"] = {
-                "url_index": g.get("url_index"),
-                "requested_elements_focus": g.get("requested_elements_focus"),
-            }
+        if not isinstance(g, dict):
+            g = {}
+        if not isinstance(p, dict):
+            p = {}
+
+        gh = g.get("preview_html") or ""
+        ph = p.get("preview_html") or ""
+        row = {
+            "title": p.get("title", f"Site {i + 1}"),
+            "source_url": p.get("source_url") or url,
+            "criteria": p.get("criteria", crit),
+            "gemini": {
+                "preview_html": gh,
+                "preview_image_b64": g.get("preview_image_png_base64"),
+                "summary": g.get("summary"),
+                "effective_analysis_target": g.get("effective_analysis_target"),
+            },
+            "featherless": {
+                "preview_html": ph,
+                "preview_image_b64": p.get("preview_image_png_base64"),
+            },
+            "featherless_notes": p.get("notes", ""),
+        }
         out.append(row)
 
     return out
@@ -500,33 +667,45 @@ def merge_preview_response(
 
 def run_garden_preview_pipeline(
     *,
-    urls: list[str],
-    user_notes: str,
     screenshots_b64: list[str],
+    sites: list[dict[str, str]] | None = None,
+    urls: list[str] | None = None,
+    user_notes: str = "",
+    include_screenshots_b64: bool = False,
 ) -> dict[str, Any]:
     """
     Full pipeline: resolve screenshots (ScreenshotOne per URL, or client images if
-    lengths match), Gemini vision pass, then Featherless HTML previews.
+    lengths match), Gemini (per-site criteria), then Featherless HTML previews.
+
+    Pass ``sites`` as ``[{ "url", "criteria" }, ...]`` or legacy ``urls`` + ``user_notes``.
+
+    If ``include_screenshots_b64`` is True, the returned dict includes ``screenshots_b64``
+    (same PNGs passed to Gemini) for debugging or integration artifacts.
     """
-    images_b64, screenshot_source = resolve_screenshot_b64_list(urls, screenshots_b64)
+    resolved = normalize_sites(sites, urls=urls, user_notes=user_notes)
+    url_list = [s["url"] for s in resolved]
+
+    images_b64, screenshot_source = resolve_screenshot_b64_list(url_list, screenshots_b64)
 
     gemini_context = gemini_analyze_screenshots(
-        urls=urls,
-        user_notes=user_notes,
+        sites=resolved,
         screenshots_b64=images_b64,
     )
 
     featherless_json = featherless_build_previews(
-        urls=urls,
-        user_notes=user_notes,
+        sites=resolved,
         gemini_context=gemini_context,
     )
 
-    merged = merge_preview_response(gemini_context, featherless_json)
+    merged = merge_preview_response(gemini_context, featherless_json, resolved)
 
-    return {
+    out: dict[str, Any] = {
+        "sites": resolved,
         "previews": merged,
         "screenshot_source": screenshot_source,
         "gemini_raw": gemini_context,
         "featherless_raw": featherless_json,
     }
+    if include_screenshots_b64:
+        out["screenshots_b64"] = images_b64
+    return out

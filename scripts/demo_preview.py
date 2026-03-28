@@ -4,6 +4,10 @@ Run the full garden preview pipeline against real APIs and write artifacts under
 
 Requires .env: FEATHERLESS_API_KEY, GEMINI_API_KEY (or GOOGLE_API_KEY), SCREENSHOTONE_ACCESS_KEY
 
+For the same flow as an automated check (PNG + JSON under tests/output/), run:
+
+  GARDN_INTEGRATION=1 .venv/bin/pytest tests/test_garden.py -v -s -m integration
+
 Usage (repo root):
 
   .venv/bin/python scripts/demo_preview.py
@@ -37,20 +41,21 @@ def main() -> None:
     out = ROOT / "output"
     out.mkdir(exist_ok=True)
 
-    urls = [
-        "https://example.com",
-        "https://example.org",
+    sites = [
+        {"url": "https://example.com", "criteria": ""},
+        {
+            "url": "https://example.org",
+            "criteria": (
+                "Call out the main heading and any obvious nav or links; "
+                "we are sampling UI to remix into a garden preview."
+            ),
+        },
     ]
-    user_notes = (
-        "Call out the main heading and any obvious nav or links; "
-        "we are sampling UI to remix into a garden preview."
-    )
 
     print("Calling ScreenshotOne → Gemini → Featherless (this may take a minute)...")
     result = run_garden_preview_pipeline(
-        urls=urls,
-        user_notes=user_notes,
         screenshots_b64=[],
+        sites=sites,
     )
 
     json_path = out / "demo_last_response.json"
@@ -58,7 +63,8 @@ def main() -> None:
 
     previews = result.get("previews") or []
     for i, p in enumerate(previews):
-        html_fragment = p.get("preview_html") or ""
+        fh = p.get("featherless") or {}
+        html_fragment = fh.get("preview_html") or ""
         title = p.get("title", f"part_{i}")
         safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in title)[:50]
         page = f"""<!DOCTYPE html>
@@ -73,8 +79,9 @@ def main() -> None:
     print("previews:", len(previews))
     for i, p in enumerate(previews):
         print(f"  [{i}] {p.get('title')!r}")
-        if p.get("visual_summary"):
-            print(f"       visual_summary: {str(p['visual_summary'])[:100]}...")
+        gm = p.get("gemini") or {}
+        if gm.get("summary"):
+            print(f"       gemini summary: {str(gm['summary'])[:100]}...")
     print()
     print(f"Wrote: {json_path}")
     print(f"HTML previews: {out}/demo_preview_*.html")

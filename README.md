@@ -14,7 +14,7 @@ Run tests (mocks LLMs; no API keys needed): `.venv/bin/pytest -v`
 **Live demo (real APIs, costs quota):** fill `.env`, then either:
 
 - `.venv/bin/python scripts/demo_preview.py` — prints a short summary and writes `output/demo_last_response.json` plus `output/demo_preview_*.html` (open the HTML in a browser).
-- `GARDN_INTEGRATION=1 .venv/bin/pytest tests/integration -v -s` — same idea; artifacts under `tests/integration/output/`.
+- `GARDN_INTEGRATION=1 .venv/bin/pytest tests/test_garden.py -v -s -m integration` — writes PNG screenshots and JSON traces under `tests/output/`.
 
 **Environment (`.env`):**
 
@@ -29,9 +29,8 @@ Copy `.env.example` to `.env` and fill in secrets. Never commit `.env`. If keys 
 
 `POST /api/garden-preview` with JSON:
 
-- `urls` — list of page URLs (server captures each with **ScreenshotOne** unless you override with `screenshots`).
-- `user_notes` — what to pull out (e.g. a `<nav>`, a button, layout notes).
-- `screenshots` — optional; only used when `len(screenshots) === len(urls)` (base64 or data URLs). Otherwise leave `[]` for automatic capture.
+- `sites` — list of `{ "url", "criteria" }` (empty `criteria` means whole-page style). Or legacy `urls` + `user_notes` (same criteria per URL).
+- `screenshots` — optional; used when length matches the number of URLs (base64 or data URLs). Otherwise leave `[]` for **ScreenshotOne** per URL.
 - `include_model_debug` — optional; if `true`, response includes raw Gemini/Featherless JSON.
 
-Response includes `screenshot_source` (`"screenshotone"` or `"client"`) and `previews`: each item has `title`, `source_url`, `preview_html`, `featherless_notes`, `visual_summary`, and `screenshot_analysis` from Gemini.
+Response includes `sites`, `screenshot_source` (`"screenshotone"` or `"client"`), and `previews`: each row has `title`, `source_url`, `criteria`, `gemini` / `featherless` (each with `preview_html` and optional `preview_image_b64`), and `featherless_notes`.

@@ -11,7 +11,7 @@ warnings.filterwarnings(
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from garden_preview import run_garden_preview_pipeline
 
@@ -36,30 +36,53 @@ app.add_middleware(
 )
 
 
-class GardenPreviewRequest(BaseModel):
-    """URLs + notes; screenshots are captured via ScreenshotOne unless you override."""
+class GardenSite(BaseModel):
+    """One URL and optional criteria; empty criteria means analyze overall page style."""
 
-    urls: list[str] = Field(
-        ...,
-        min_length=1,
-        description="Page URLs to capture (one ScreenshotOne shot per URL, in order).",
+    url: str = Field(..., description="Page URL to capture (ScreenshotOne or client image).")
+    criteria: str = Field(
+        default="",
+        description=(
+            "What to analyze for this URL (e.g. hero, nav). Leave empty for whole-site style."
+        ),
+    )
+
+
+class GardenPreviewRequest(BaseModel):
+    """Per-site criteria; screenshots optional override when length matches URLs."""
+
+    sites: list[GardenSite] | None = Field(
+        default=None,
+        description="URLs with optional criteria each; preferred over legacy urls/user_notes.",
+    )
+    urls: list[str] | None = Field(
+        default=None,
+        description="Legacy: same criteria (user_notes) applied to every URL.",
     )
     user_notes: str = Field(
         default="",
-        description="What they want (e.g. the <nav>, a specific button, hero layout).",
+        description="Legacy: applied to each URL when `sites` is omitted.",
     )
     screenshots: list[str] = Field(
         default_factory=list,
         description=(
-            "Optional. If len(screenshots) == len(urls), these base64/data-URL images "
-            "are used instead of ScreenshotOne (testing/overrides). Otherwise leave empty "
-            "to capture each URL server-side."
+            "Optional. If len(screenshots) matches the number of sites/URLs, these "
+            "base64/data-URL images are used instead of ScreenshotOne (testing/overrides). "
+            "Otherwise leave empty to capture each URL server-side."
         ),
     )
     include_model_debug: bool = Field(
         default=False,
         description="If true, include gemini_raw and featherless_raw in the response.",
     )
+
+    @model_validator(mode="after")
+    def _require_sites_or_urls(self):
+        if self.sites and len(self.sites) > 0:
+            return self
+        if self.urls and len(self.urls) > 0:
+            return self
+        raise ValueError("Provide non-empty `sites` or legacy `urls`.")
 
 
 @app.get("/health")
@@ -71,10 +94,15 @@ def health():
 def garden_preview(body: GardenPreviewRequest):
     """
     Captures each URL with ScreenshotOne (unless client sends matching-length screenshots),
-    runs Gemini on those images, then Featherless for HTML preview fragments.
+    runs Gemini per-site criteria on those images, then Featherless for HTML previews.
     """
     try:
+        if body.sites and len(body.sites) > 0:
+            site_dicts = [s.model_dump() for s in body.sites]
+        else:
+            site_dicts = None
         out = run_garden_preview_pipeline(
+            sites=site_dicts,
             urls=body.urls,
             user_notes=body.user_notes,
             screenshots_b64=body.screenshots,
